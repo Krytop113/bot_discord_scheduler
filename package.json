@@ -1,0 +1,16 @@
+{
+  "name": "scheduler",
+  "version": "1.0.0",
+  "description": "AMVBG bot discord scheduler",
+  "license": "ISC",
+  "author": "Javier Leander Wjaya - 2472013",
+  "type": "commonjs",
+  "main": "index.js",
+  "scripts": {
+    "test": "echo \"Error: no test specified\" && exit 1"
+  },
+  "dependencies": {
+    "discord.js": "^14.28.1",
+    "dotenv": "^18.0.9"
+  }
+}

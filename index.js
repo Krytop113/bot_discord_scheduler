@@ -32,6 +32,7 @@ const SUMMARY_CHANNEL_ID = process.env.SUMMARY_CHANNEL_ID;
 let state = {
   todos: {}, // Key: "guildId:userId" => Array of { id, task, deadlineTimestamp, assigneeId, createdBy, createdAt }
   reminders: [],
+  lastReminderSentAt: 0, // Timestamp pengingat berkala terakhir dikirim
 };
 
 let masterMessageId = null;
@@ -134,8 +135,17 @@ async function purgeExpiredTodos() {
   }
 }
 
+function formatAssignee(assignee) {
+  if (!assignee) return "Tidak ada";
+  if (assignee === "@everyone" || assignee === "everyone") return "@everyone";
+  if (assignee === "@here" || assignee === "here") return "@here";
+  if (/^\d{17,20}$/.test(assignee)) return `<@${assignee}>`; // User / Role ID
+  if (assignee.startsWith("<@") && assignee.endsWith(">")) return assignee; // Raw mention
+  return assignee;
+}
+
 // Generate Embed Ringkasan Server dengan Penanggung Jawab
-async function generateSummaryEmbed(guildId) {
+async function generateSummaryEmbed(guildId, maxDaysAhead = null) {
   const now = Date.now();
   let allGuildTodos = [];
 
@@ -143,16 +153,24 @@ async function generateSummaryEmbed(guildId) {
     if (storeKey.startsWith(`${guildId}:`)) {
       state.todos[storeKey].forEach((t) => {
         if (t.deadlineTimestamp > now) {
-          allGuildTodos.push(t);
+          if (
+            maxDaysAhead === null ||
+            t.deadlineTimestamp <= now + maxDaysAhead * 24 * 60 * 60 * 1000
+          ) {
+            allGuildTodos.push(t);
+          }
         }
       });
     }
   }
 
   if (allGuildTodos.length === 0) {
+    const desc = maxDaysAhead
+      ? `🎉 Tidak ada tugas dalam rentang H-${maxDaysAhead} hari ke depan!`
+      : "🎉 Tidak ada tugas aktif yang terdaftar saat ini!";
     return new EmbedBuilder()
       .setTitle("📢 Ringkasan To-Do & Deadline Server")
-      .setDescription("🎉 Tidak ada tugas aktif yang terdaftar saat ini!")
+      .setDescription(desc)
       .setColor(0x00ff88)
       .setTimestamp();
   }
@@ -162,15 +180,21 @@ async function generateSummaryEmbed(guildId) {
 
   const formattedList = allGuildTodos
     .map((item, i) => {
-      const assigneeMention = item.assigneeId
-        ? `<@${item.assigneeId}>`
-        : `<@${item.createdBy}>`;
-      return `**${i + 1}. ${item.task}**\n   👤 Penanggung Jawab: ${assigneeMention}\n   ⏰ Deadline: \`${formatDate(item.deadlineTimestamp)}\``;
+      const assigneeMention = formatAssignee(item.assigneeId || item.createdBy);
+      let entry = `**${i + 1}. ${item.task}**\n   👤 Penanggung Jawab: ${assigneeMention}\n   ⏰ Deadline: \`${formatDate(item.deadlineTimestamp)}\``;
+      if (item.notes) {
+        entry += `\n   📝 Catatan: *${item.notes}*`;
+      }
+      return entry;
     })
     .join("\n\n");
 
+  const title = maxDaysAhead
+    ? `📢 Pengingat To-Do & Deadline (Mendekati H-${maxDaysAhead} Hari)`
+    : "📢 Ringkasan To-Do & Deadline Server (Urutan Terdekat)";
+
   return new EmbedBuilder()
-    .setTitle("📢 Ringkasan To-Do & Deadline Server (Urutan Terdekat)")
+    .setTitle(title)
     .setDescription(formattedList)
     .setColor(0x4d94ff)
     .setFooter({
@@ -179,19 +203,72 @@ async function generateSummaryEmbed(guildId) {
     .setTimestamp();
 }
 
-// Kirim Pengingat ke Channel Pengumuman
-async function sendAnnouncementReminder(guildId) {
+// Kirim Pengingat ke Channel Pengumuman (Filter H-14 & Mention PJ Terdekat)
+async function sendAnnouncementReminder(guildId, force = false) {
   await purgeExpiredTodos();
   const summaryChannel = await client.channels.fetch(SUMMARY_CHANNEL_ID);
-  if (summaryChannel) {
-    const embed = await generateSummaryEmbed(guildId);
-    await summaryChannel.send({
-      content: "🔔 **PENGINGAT PENGUMUMAN SERVER: DAFTAR TO-DO & DEADLINE**",
-      embeds: [embed],
-    });
-    return true;
+  if (!summaryChannel) return false;
+
+  const now = Date.now();
+  const twoDaysMs = 2 * 24 * 60 * 60 * 1000;
+  const fourteenDaysMs = 14 * 24 * 60 * 60 * 1000;
+
+  // Dapatkan seluruh tugas aktif server
+  let urgentTodos = [];
+  for (const storeKey in state.todos) {
+    if (storeKey.startsWith(`${guildId}:`)) {
+      state.todos[storeKey].forEach((t) => {
+        if (
+          t.deadlineTimestamp > now &&
+          t.deadlineTimestamp <= now + fourteenDaysMs
+        ) {
+          urgentTodos.push(t);
+        }
+      });
+    }
   }
-  return false;
+
+  // Jika tidak ada tugas mendesak dalam rentang 14 hari
+  if (urgentTodos.length === 0) {
+    if (force) {
+      const embed = await generateSummaryEmbed(guildId, 14);
+      await summaryChannel.send({ embeds: [embed] });
+      return true;
+    }
+    return false;
+  }
+
+  // Cek jeda 2 hari sekali untuk pengingat otomatis (kecuali pemicu manual / force)
+  if (!force && state.lastReminderSentAt) {
+    const elapsed = now - state.lastReminderSentAt;
+    if (elapsed < twoDaysMs) {
+      return false; // Belum genap 2 hari sejak pengingat terakhir
+    }
+  }
+
+  // Urutkan tugas dari deadline paling dekat
+  urgentTodos.sort((a, b) => a.deadlineTimestamp - b.deadlineTimestamp);
+  const nearestTodo = urgentTodos[0];
+  const nearestAssignee = formatAssignee(
+    nearestTodo.assigneeId || nearestTodo.createdBy,
+  );
+
+  const embed = await generateSummaryEmbed(guildId, 14);
+
+  let mentionContent = `🔔 **PENGINGAT DEADLINE MENDEKAT (H-14)**\n⚠️ Perhatian untuk tugas terdekat: **"${nearestTodo.task}"** (Deadline: \`${formatDate(nearestTodo.deadlineTimestamp)}\`)`;
+  if (nearestTodo.notes) {
+    mentionContent += `\n📝 Catatan Penting: *${nearestTodo.notes}*`;
+  }
+  mentionContent += `\n👉 Ditujukan kepada: ${nearestAssignee}`;
+
+  await summaryChannel.send({
+    content: mentionContent,
+    embeds: [embed],
+  });
+
+  state.lastReminderSentAt = now;
+  await saveState();
+  return true;
 }
 
 // =============================================================================
@@ -280,6 +357,7 @@ client.on(Events.InteractionCreate, async (interaction) => {
       const deadlineStr = interaction.options.getString("deadline");
       const assigneeUser =
         interaction.options.getUser("penanggung_jawab") || user;
+      const notes = interaction.options.getString("catatan") || null;
 
       const deadlineParsed = new Date(deadlineStr.replace(" ", "T"));
       if (
@@ -300,6 +378,7 @@ client.on(Events.InteractionCreate, async (interaction) => {
         task,
         deadlineTimestamp: deadlineParsed.getTime(),
         assigneeId: assigneeUser.id,
+        notes,
         createdBy: user.id,
         createdAt: Date.now(),
       };
@@ -308,13 +387,15 @@ client.on(Events.InteractionCreate, async (interaction) => {
       await saveState();
       await logAudit(
         "TAMBAH TODO",
-        `Tugas: **"${task}"** | Penanggung Jawab: <@${assigneeUser.id}> | Deadline: \`${formatDate(todoObj.deadlineTimestamp)}\``,
+        `Tugas: **"${task}"** | Penanggung Jawab: <@${assigneeUser.id}> | Deadline: \`${formatDate(todoObj.deadlineTimestamp)}\`${notes ? ` | Catatan: "${notes}"` : ""}`,
         user,
       );
 
-      await interaction.editReply({
-        content: `✅ **Tugas Ditambahkan:** "${task}"\n👤 **Penanggung Jawab:** <@${assigneeUser.id}>\n⏰ **Deadline:** \`${formatDate(todoObj.deadlineTimestamp)}\``,
-      });
+      let replyMsg = `✅ **Tugas Ditambahkan:** "${task}"\n👤 **Penanggung Jawab:** <@${assigneeUser.id}>\n⏰ **Deadline:** \`${formatDate(todoObj.deadlineTimestamp)}\``;
+      if (notes) {
+        replyMsg += `\n📝 **Catatan:** ${notes}`;
+      }
+      await interaction.editReply({ content: replyMsg });
     } else if (subcommand === "done") {
       await interaction.deferReply({ flags: MessageFlags.Ephemeral });
       await purgeExpiredTodos();
@@ -379,6 +460,130 @@ client.on(Events.InteractionCreate, async (interaction) => {
       await purgeExpiredTodos();
       const embed = await generateSummaryEmbed(guildId);
       await interaction.editReply({ embeds: [embed] });
+    } else if (subcommand === "template") {
+      await interaction.deferReply({ flags: MessageFlags.Ephemeral });
+      const csvContent =
+        "Tugas,Deadline,Penanggung Jawab,Catatan\n" +
+        "Bersihkan Altar Utama,2026-11-20 09:00,@everyone,Siapkan kain lap khusus altar & minyak dupa\n" +
+        "Persiapan Lilin & Dupa,2026-11-18 14:00,@here,Pastikan stok lilin merah ukuran besar cukup\n" +
+        "Pengecekan Sound System & Mic,2026-11-16 10:00,123456789012345678,Tes baterai wireless mic dan kabel mixer\n" +
+        "Latihan Tim Kebaktian,2026-11-25 18:00,Javier,Bawa buku paritta & susunan acara terbaru\n";
+
+      const csvBuffer = Buffer.from(csvContent, "utf8");
+      const attachment = new AttachmentBuilder(csvBuffer, {
+        name: "template_tugas.csv",
+      });
+
+      await interaction.editReply({
+        content:
+          "📥 **Template CSV Jadwal & Tugas Vihara**\nSilakan download file ini, buka/edit di Microsoft Excel atau Google Sheets, lalu import kembali dengan command `/todo import`.",
+        files: [attachment],
+      });
+    } else if (subcommand === "import") {
+      await interaction.deferReply({ flags: MessageFlags.Ephemeral });
+      const attachment = interaction.options.getAttachment("file");
+
+      if (!attachment || !attachment.name.endsWith(".csv")) {
+        return interaction.editReply({
+          content: "❌ File harus berformat `.csv`! Pastikan export dari Excel/Spreadsheet ke format CSV.",
+        });
+      }
+
+      try {
+        const response = await fetch(attachment.url);
+        const textData = await response.text();
+
+        // Pisahkan per baris
+        const lines = textData
+          .split(/\r?\n/)
+          .map((line) => line.trim())
+          .filter((line) => line.length > 0);
+
+        if (lines.length <= 1) {
+          return interaction.editReply({
+            content: "❌ File CSV kosong atau hanya memiliki baris header!",
+          });
+        }
+
+        // Deteksi delimiter (, atau ;)
+        const delimiter = lines[0].includes(";") ? ";" : ",";
+
+        // Abaikan baris header pertama
+        const dataRows = lines.slice(1);
+        let importedCount = 0;
+        let failedRows = [];
+
+        for (let i = 0; i < dataRows.length; i++) {
+          const row = dataRows[i];
+          const cols = row.split(delimiter).map((c) => c.trim().replace(/^["']|["']$/g, ""));
+
+          const task = cols[0];
+          const deadlineStr = cols[1];
+          const rawAssignee = cols[2];
+          const notes = cols[3] || null;
+
+          if (!task || !deadlineStr) {
+            failedRows.push(`Baris ${i + 2}: Kolom tugas atau deadline kosong`);
+            continue;
+          }
+
+          const deadlineParsed = new Date(deadlineStr.replace(" ", "T"));
+          if (isNaN(deadlineParsed.getTime()) || deadlineParsed.getTime() <= Date.now()) {
+            failedRows.push(`Baris ${i + 2}: Deadline tidak valid / sudah lewat ("${deadlineStr}")`);
+            continue;
+          }
+
+          let assigneeVal = user.id;
+          if (rawAssignee) {
+            if (rawAssignee.toLowerCase() === "@everyone" || rawAssignee.toLowerCase() === "everyone") {
+              assigneeVal = "@everyone";
+            } else if (rawAssignee.toLowerCase() === "@here" || rawAssignee.toLowerCase() === "here") {
+              assigneeVal = "@here";
+            } else {
+              // Jika format <@123456> atau ID mentah 123456
+              const idMatch = rawAssignee.match(/\d{17,20}/);
+              assigneeVal = idMatch ? idMatch[0] : rawAssignee;
+            }
+          }
+
+          const todoObj = {
+            id: (Date.now() + i).toString(),
+            task,
+            deadlineTimestamp: deadlineParsed.getTime(),
+            assigneeId: assigneeVal,
+            notes,
+            createdBy: user.id,
+            createdAt: Date.now(),
+          };
+
+          state.todos[storeKey].push(todoObj);
+          importedCount++;
+        }
+
+        if (importedCount > 0) {
+          await saveState();
+          await logAudit(
+            "IMPORT CSV TODO",
+            `User berhasil mengimpor **${importedCount} tugas** via spreadsheet CSV.`,
+            user,
+          );
+        }
+
+        let resultMsg = `✅ **Berhasil mengimpor ${importedCount} tugas!**`;
+        if (failedRows.length > 0) {
+          resultMsg += `\n⚠️ **${failedRows.length} baris dilewati:**\n` + failedRows.slice(0, 5).join("\n");
+          if (failedRows.length > 5) {
+            resultMsg += `\n...dan ${failedRows.length - 5} baris lainnya.`;
+          }
+        }
+
+        await interaction.editReply({ content: resultMsg });
+      } catch (err) {
+        console.error("Gagal import file CSV:", err);
+        await interaction.editReply({
+          content: "❌ Terjadi kesalahan saat membaca file CSV. Pastikan format file sesuai.",
+        });
+      }
     }
   }
 
@@ -388,7 +593,7 @@ client.on(Events.InteractionCreate, async (interaction) => {
   if (commandName === "remind") {
     await interaction.deferReply({ flags: MessageFlags.Ephemeral });
 
-    const success = await sendAnnouncementReminder(guildId);
+    const success = await sendAnnouncementReminder(guildId, true);
 
     if (success) {
       await logAudit(

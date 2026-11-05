@@ -30,6 +30,14 @@ const commands = [
               "Tag orang yang bertanggung jawab (opsional, default: kamu)",
             )
             .setRequired(false),
+        )
+        .addStringOption((opt) =>
+          opt
+            .setName("catatan")
+            .setDescription(
+              "Catatan / deskripsi tambahan untuk tugas (opsional)",
+            )
+            .setRequired(false),
         ),
     )
     .addSubcommand((sub) =>
@@ -49,6 +57,28 @@ const commands = [
       sub
         .setName("summary")
         .setDescription("Cetak laporan ringkasan seluruh tugas server"),
+    )
+    .addSubcommand((sub) =>
+      sub
+        .setName("template")
+        .setDescription(
+          "Download file template CSV untuk import tugas massal",
+        ),
+    )
+    .addSubcommand((sub) =>
+      sub
+        .setName("import")
+        .setDescription(
+          "Import banyak tugas sekaligus via file Spreadsheet / CSV",
+        )
+        .addAttachmentOption((opt) =>
+          opt
+            .setName("file")
+            .setDescription(
+              "Upload file CSV (Format: Tugas, Deadline, Penanggung Jawab, Catatan)",
+            )
+            .setRequired(true),
+        ),
     ),
 
   new SlashCommandBuilder()
